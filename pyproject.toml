@@ -1,0 +1,32 @@
+[project]
+name = "vea-challenger"
+version = "0.1.0"
+description = "Independent challenger bot for the Vea optimistic bridge: watches claims, verifies state roots against the inbox, and challenges fraud."
+readme = "README.md"
+authors = [
+    { email = "mani99brar@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-settings>=2",
+    "web3>=7",
+]
+
+[project.scripts]
+vea-challenger = "vea_challenger.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.27,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: tests that hit public testnet RPCs (deselected by default; run with -m live)",
+]
+addopts = "-m 'not live'"

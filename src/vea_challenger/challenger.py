@@ -1,0 +1,171 @@
+"""The deadline-critical path: submitting challenge transactions.
+
+Pre-flight checks immediately before broadcast (the struct may have changed
+since the verdict):
+
+- reconstructed struct hashes to the on-chain ``claimHashes[epoch]``
+- nobody has challenged yet (``challenger == 0``) and ``honest == None``
+- funds: native deposit + gas reserve (ArbToEth) or WETH balance + allowance
+  (ArbToGnosis; allowance is topped up with a one-time max approve)
+
+The deposit sent is *exactly* ``deposit``: the contract refunds overpayment via
+``.send()`` with a 2300-gas stipend, which silently burns money sent from
+anything but a plain EOA.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from .claims import ZERO_ADDRESS, Party
+from .contracts import OutboxContract, OutboxParams, WethToken
+from .notify import CRITICAL, INFO, Notifier
+from .store import CHALLENGE_PENDING, CHALLENGED, ClaimRow, Store
+from .txsender import TxSender
+from .verdict import earliest_verification_ts
+
+log = logging.getLogger(__name__)
+
+MAX_UINT256 = 2**256 - 1
+
+
+class Challenger:
+    def __init__(
+        self,
+        store: Store,
+        outbox: OutboxContract,
+        params: OutboxParams,
+        sender: TxSender,
+        notifier: Notifier,
+        weth: WethToken | None,
+        gas_reserve_wei: int,
+        devnet: bool,
+        dry_run: bool,
+    ):
+        self.store = store
+        self.outbox = outbox
+        self.params = params
+        self.sender = sender
+        self.notifier = notifier
+        self.weth = weth
+        self.gas_reserve_wei = gas_reserve_wei
+        self.devnet = devnet
+        self.dry_run = dry_run
+
+    # -- funding ----------------------------------------------------------------
+
+    def can_fund_challenge(self) -> bool:
+        native = self.sender.client.with_failover(
+            lambda w3: w3.eth.get_balance(self.sender.address)
+        )
+        if self.weth is not None:
+            return (
+                native >= self.gas_reserve_wei
+                and self.weth.balance_of(self.sender.address) >= self.params.deposit
+            )
+        return native >= self.params.deposit + self.gas_reserve_wei
+
+    def ensure_allowance(self) -> None:
+        if self.weth is None or self.dry_run:
+            return
+        allowance = self.weth.allowance(self.sender.address, self.outbox.address)
+        if allowance >= self.params.deposit * 16:
+            return
+        log.info("approving WETH for outbox %s", self.outbox.address)
+        self.sender.send(
+            self.weth.approve_fn(self.outbox.address, MAX_UINT256),
+            epoch=0,
+            action="weth_approve",
+        )
+
+    # -- challenge ----------------------------------------------------------------
+
+    def urgency(self, row: ClaimRow, now: int) -> float:
+        """Fee multiplier that ramps as the hard deadline approaches."""
+        deadline = earliest_verification_ts(
+            row.claim.timestamp_claimed,
+            self.params.epoch_period,
+            self.outbox.sequencer_delay_limit(),
+            self.params.min_challenge_period,
+            self.devnet,
+        )
+        remaining = deadline - now
+        if remaining <= 900:
+            return 5.0
+        if remaining <= 3600:
+            return 3.0
+        if remaining <= 4 * 3600:
+            return 2.0
+        return 1.0
+
+    def challenge(self, row: ClaimRow) -> bool:
+        """Attempt to challenge; returns True when the challenge confirmed."""
+        epoch = row.epoch
+
+        # Pre-flight: fresh on-chain state.
+        onchain = self.outbox.claim_hash(epoch)
+        if onchain != row.claim.hash():
+            log.info("epoch %s: struct stale before challenge; deferring to reconcile", epoch)
+            return False
+        if row.claim.challenger != ZERO_ADDRESS or row.claim.honest != Party.NONE:
+            return False
+
+        if self.dry_run:
+            self.notifier.send(
+                CRITICAL,
+                f"DRY-RUN: would challenge epoch {epoch} "
+                f"(claimed 0x{row.claim.state_root.hex()}, true {row.true_root})",
+            )
+            return False
+
+        if not self.can_fund_challenge():
+            self.notifier.send(
+                CRITICAL,
+                f"INSUFFICIENT FUNDS to challenge fraudulent claim epoch {epoch} — "
+                f"an unchallenged fraud WILL verify. Fund {self.sender.address} now.",
+            )
+            return False
+        self.ensure_allowance()
+
+        now = self.outbox.now()
+        value = self.params.deposit if self.weth is None else 0
+        fn = self.outbox.contract().functions.challenge(epoch, row.claim.as_tuple())
+
+        row.status = CHALLENGE_PENDING
+        self.store.upsert_claim(row)
+        try:
+            receipt = self.sender.send(
+                fn,
+                epoch=epoch,
+                action="challenge",
+                value=value,
+                urgency=self.urgency(row, now),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Someone may have front-run us, or the struct changed; the next
+            # sync/reconcile pass picks up the truth.
+            log.warning("challenge tx failed for epoch %s: %s", epoch, exc)
+            row.status = CHALLENGE_PENDING
+            row.note = f"challenge attempt failed: {exc}"
+            self.store.upsert_claim(row)
+            return False
+
+        row.challenge_tx = receipt["transactionHash"].to_0x_hex()
+        row.status = CHALLENGED
+        # The contract sets challenger to msg.sender (we use the 2-arg overload).
+        row.claim = row.claim.__class__(
+            state_root=row.claim.state_root,
+            claimer=row.claim.claimer,
+            timestamp_claimed=row.claim.timestamp_claimed,
+            timestamp_verification=row.claim.timestamp_verification,
+            blocknumber_verification=row.claim.blocknumber_verification,
+            honest=row.claim.honest,
+            challenger=self.sender.address,
+        )
+        self.store.upsert_claim(row)
+        self.notifier.send(
+            INFO,
+            f"CHALLENGED epoch {epoch}: claimed 0x{row.claim.state_root.hex()} "
+            f"!= true {row.true_root} (tx {row.challenge_tx})",
+        )
+        return True
