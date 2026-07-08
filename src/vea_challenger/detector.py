@@ -74,9 +74,16 @@ class Detector:
         for ev in events:
             try:
                 self._apply_event(ev)
-            except Exception:  # noqa: BLE001 - one bad event must not stall the cursor
+            except Exception:  # noqa: BLE001
+                # Do NOT skip past a failed event: a dropped Claimed is a fraud
+                # the bot would never track. Rewind the cursor to just before it
+                # and retry the range next tick (all handlers are idempotent).
                 log.exception("failed applying event %s", ev)
-                self.notifier.send(CRITICAL, f"event processing failed: {ev}")
+                self.notifier.send(
+                    CRITICAL, f"event processing failed (will retry next tick): {ev}"
+                )
+                self.store.set_cursor("outbox_events", ev["block_number"] - 1)
+                return
         self.store.set_cursor("outbox_events", head)
 
     def _apply_event(self, ev: dict) -> None:
@@ -133,11 +140,18 @@ class Detector:
                 self.challenge_address is not None
                 and challenger.lower() == self.challenge_address.lower()
             )
+            # Only transition rows that haven't advanced past the challenge
+            # stage: a rescan of an old Challenged event must not drag a
+            # SNAPSHOT_SENT/RESOLVED row backwards.
+            pre_challenge = row.status in (SEEN, UNDECIDED, CHALLENGE_PENDING)
             if ours:
-                row.status = CHALLENGED
+                if pre_challenge:
+                    row.status = CHALLENGED
                 row.challenge_tx = row.challenge_tx or ev["tx_hash"]
                 self.notifier.send(INFO, f"our challenge confirmed for epoch {epoch}")
-            elif row.status not in _OUR_CHALLENGE_STATES:
+            elif pre_challenge:
+                # Includes CHALLENGE_PENDING: a third party front-ran our
+                # challenge; stand down (the fraud is handled either way).
                 row.status = CHALLENGED_BY_OTHER
                 self.notifier.send(
                     WARNING, f"epoch {epoch} challenged by third party {challenger}"
@@ -163,6 +177,19 @@ class Detector:
     def _apply_verified(self, row: ClaimRow) -> None:
         """`Verified` does not say who won — probe the on-chain hash."""
         onchain = self.outbox.claim_hash(row.epoch)
+        if onchain == b"\x00" * 32:
+            # Verified and already withdrawn before we processed the event.
+            # The withdrawal paid claim.challenger / claim.claimer directly, so
+            # funds are safe either way; flag for a human to confirm which.
+            row.status = WITHDRAWN
+            row.note = "verified + withdrawn before processing; verify balances"
+            self.store.upsert_claim(row)
+            self.notifier.send(
+                WARNING,
+                f"epoch {row.epoch}: verified and withdrawn in one scan window; "
+                "check whether the challenge won (balances)",
+            )
+            return
         matched = find_matching(row.claim, onchain)
         if matched is None:
             row.status = DESYNC
@@ -242,16 +269,19 @@ class Detector:
         """Verdict for a SEEN/UNDECIDED claim from quorum inbox reads."""
         finalized_snapshot = finalized_ts = None
         latest_snapshot = latest_ts = None
+        complete = True  # every configured RPC answered every read we used
         try:
-            snap, view = self.inbox.snapshot_quorum(row.epoch, FINALIZED)
+            snap, view, full = self.inbox.snapshot_quorum(row.epoch, FINALIZED)
             finalized_snapshot, finalized_ts = snap, view.timestamp
+            complete = complete and full
         except QuorumError as exc:
             self.notifier.send(CRITICAL, f"epoch {row.epoch}: finalized quorum split: {exc}")
         except Exception as exc:  # noqa: BLE001
             log.warning("finalized read failed for epoch %s: %s", row.epoch, exc)
         try:
-            snap, view = self.inbox.snapshot_quorum(row.epoch, LATEST)
+            snap, view, full = self.inbox.snapshot_quorum(row.epoch, LATEST)
             latest_snapshot, latest_ts = snap, view.timestamp
+            complete = complete and full
         except QuorumError as exc:
             self.notifier.send(CRITICAL, f"epoch {row.epoch}: latest quorum split: {exc}")
         except Exception as exc:  # noqa: BLE001
@@ -269,6 +299,16 @@ class Detector:
                 latest_snapshot=latest_snapshot,
             )
         )
+
+        if verdict == Verdict.HONEST and not complete:
+            # HONEST is irreversible (we stop tracking): it requires agreement
+            # from every configured RPC, not just the reachable ones.
+            self.notifier.send(
+                WARNING,
+                f"epoch {row.epoch}: looks honest but not all RPCs answered; "
+                "withholding the terminal verdict",
+            )
+            verdict = Verdict.WAIT
 
         if verdict == Verdict.HONEST:
             row.status = HONEST

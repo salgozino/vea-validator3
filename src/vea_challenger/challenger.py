@@ -98,6 +98,26 @@ class Challenger:
             return 2.0
         return 1.0
 
+    def _stuck_challenge_nonce(self, epoch: int) -> int | None:
+        """Nonce of an in-flight (broadcast, unmined) challenge to replace."""
+        replace: int | None = None
+        for intent in self.store.open_intents("challenge"):
+            if intent["epoch"] != epoch or intent["sender"] != self.sender.address:
+                continue
+            if intent["tx_hash"] and self.sender.client.receipt_or_none(intent["tx_hash"]):
+                # Mined (possibly reverted); the event scan / reconcile pass
+                # will surface the outcome. Nothing to replace.
+                self.store.journal_final(intent["id"], "MINED")
+                continue
+            self.store.journal_final(intent["id"], "SUPERSEDED")
+            if intent["tx_hash"] and intent["nonce"] is not None:
+                confirmed = self.sender.client.with_failover(
+                    lambda w3: w3.eth.get_transaction_count(self.sender.address)
+                )
+                if intent["nonce"] >= confirmed:
+                    replace = int(intent["nonce"])
+        return replace
+
     def challenge(self, row: ClaimRow) -> bool:
         """Attempt to challenge; returns True when the challenge confirmed."""
         epoch = row.epoch
@@ -127,9 +147,20 @@ class Challenger:
             return False
         self.ensure_allowance()
 
-        now = self.outbox.now()
+        try:
+            urgency = self.urgency(row, self.outbox.now())
+        except Exception as exc:  # noqa: BLE001 - urgency is best-effort
+            log.warning("urgency computation failed (%s); using max", exc)
+            urgency = 5.0
         value = self.params.deposit if self.weth is None else 0
         fn = self.outbox.contract().functions.challenge(epoch, row.claim.as_tuple())
+
+        # If a previous attempt is stuck in the mempool, replace it at the same
+        # nonce with escalated fees instead of queueing behind it.
+        nonce_override = self._stuck_challenge_nonce(epoch)
+        if nonce_override is not None:
+            urgency = max(urgency, 3.0)
+            log.info("epoch %s: replacing stuck challenge at nonce %s", epoch, nonce_override)
 
         row.status = CHALLENGE_PENDING
         self.store.upsert_claim(row)
@@ -139,11 +170,13 @@ class Challenger:
                 epoch=epoch,
                 action="challenge",
                 value=value,
-                urgency=self.urgency(row, now),
+                urgency=urgency,
+                nonce_override=nonce_override,
             )
         except Exception as exc:  # noqa: BLE001
-            # Someone may have front-run us, or the struct changed; the next
-            # sync/reconcile pass picks up the truth.
+            # Someone may have front-run us, or the struct changed, or the RPC
+            # dropped the tx. The row stays CHALLENGE_PENDING and the watcher
+            # RETRIES it every tick until Challenged appears or the state moves.
             log.warning("challenge tx failed for epoch %s: %s", epoch, exc)
             row.status = CHALLENGE_PENDING
             row.note = f"challenge attempt failed: {exc}"

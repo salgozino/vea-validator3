@@ -68,6 +68,7 @@ class Resolver:
         self.notifier = notifier
         self.challenge_address = challenge_address
         self.dry_run = dry_run
+        self._adoption_checked: set[int] = set()
 
     def tick(self, rows: list[ClaimRow]) -> None:
         if self.dry_run:
@@ -113,18 +114,29 @@ class Resolver:
         )
 
     def _find_existing_ticket(self, row: ClaimRow) -> tuple[str, str] | None:
-        """Scan SnapshotSent events for this epoch; verify the struct they carried."""
+        """Scan recent SnapshotSent events for this epoch; verify the struct they carried.
+
+        Best-effort optimization only (adopting a third party's ticket saves one
+        sendSnapshot tx): the scan window is small and the result is cached per
+        process, because a duplicate sendSnapshot is harmless — the loser merely
+        emits FailedResolution after the winner resolves.
+        """
+        if row.epoch in self._adoption_checked:
+            return None
+        self._adoption_checked.add(row.epoch)
         try:
             head = self.inbox.client.latest_block_number()
             events = self.inbox.snapshot_sent_events(
-                row.epoch, max(0, head - 2_000_000), head
+                row.epoch, max(0, head - 120_000), head
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("SnapshotSent scan failed: %s", exc)
             return None
         for ev in events:
             try:
-                receipt = self.inbox.client.wait_receipt(ev["tx_hash"], timeout=30)
+                receipt = self.inbox.client.receipt_or_none(ev["tx_hash"])
+                if receipt is None:
+                    continue
                 msg = parse_l2tol1_event(self.inbox.client, receipt)
                 carried = decode_claim_from_l2tol1_data(msg["data"])
                 if carried is not None and carried.hash() == row.claim.hash():
@@ -138,12 +150,17 @@ class Resolver:
     def execute_l1(self, row: ClaimRow) -> None:
         if not row.l2tol1_json:
             # Crash window: snapshot sent but message not journaled. Re-derive.
-            if row.snapshot_tx:
-                receipt = self.inbox.client.wait_receipt(row.snapshot_tx, timeout=30)
+            receipt = (
+                self.inbox.client.receipt_or_none(row.snapshot_tx)
+                if row.snapshot_tx
+                else None
+            )
+            if receipt is not None:
                 row.l2tol1_json = json.dumps(parse_l2tol1_event(self.inbox.client, receipt))
                 self.store.upsert_claim(row)
             else:
                 row.status = CHALLENGED  # re-run step 1
+                row.snapshot_tx = None
                 self.store.upsert_claim(row)
                 return
         msg = json.loads(row.l2tol1_json)
@@ -196,6 +213,10 @@ class Resolver:
 
     def escape_hatch(self, row: ClaimRow) -> None:
         if self.dry_run or not self._ours(row):
+            return
+        if row.claim.honest != Party.NONE:
+            # Resolved claims never go through the escape hatch (the contract
+            # requires honest == None); RESOLVED rows use withdraw() instead.
             return
         fn = self.outbox.contract().functions.withdrawChallengerEscapeHatch(
             row.epoch, row.claim.as_tuple()

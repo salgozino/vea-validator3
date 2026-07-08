@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 from web3 import Web3
@@ -47,6 +46,7 @@ class OutboxContract:
             id(w3): w3.eth.contract(address=self.address, abi=abi.OUTBOX_ABI)
             for w3 in client.all_w3()
         }
+        self._ts_cache: dict[int, int] = {}
 
     def _c(self, w3: Web3):
         return self._contract_for[id(w3)]
@@ -136,9 +136,12 @@ class OutboxContract:
         events.sort(key=lambda e: (e["block_number"], e["log_index"]))
         return events
 
-    @lru_cache(maxsize=4096)
     def block_timestamp(self, block_number: int) -> int:
-        return int(self.client.block(block_number)["timestamp"])
+        cached = self._ts_cache.get(block_number)
+        if cached is None:
+            cached = int(self.client.block(block_number)["timestamp"])
+            self._ts_cache[block_number] = cached
+        return cached
 
     def now(self) -> int:
         """Outbox-chain clock (latest block timestamp)."""
@@ -157,12 +160,14 @@ class InboxContract:
     def _contract(self, w3: Web3):
         return w3.eth.contract(address=self.address, abi=abi.INBOX_ABI)
 
-    def snapshot_quorum(self, epoch: int, tag: str) -> tuple[bytes, L2View]:
-        """(snapshots(epoch), block view) at `tag`, agreed by every configured RPC.
+    def snapshot_quorum(self, epoch: int, tag: str) -> tuple[bytes, L2View, bool]:
+        """(snapshots(epoch), block view, complete) at `tag`.
 
-        The block is pinned by number on each provider so the snapshot value and
-        the view refer to the same height per provider; providers must agree on
-        the snapshot value. The returned view is the *minimum* timestamp across
+        Every *reachable* RPC must agree on the snapshot value; ``complete`` is
+        True only when every *configured* RPC answered. The irreversible HONEST
+        verdict requires ``complete`` (N-of-N), so a single lying RPC cannot
+        hide a fraud by making its peers unreachable. The block is pinned by
+        number per provider; the returned view is the minimum timestamp across
         providers (conservative for "has the epoch ended" checks).
         """
 
@@ -174,6 +179,7 @@ class InboxContract:
             return (bytes(root), int(block["timestamp"]), int(block["number"]))
 
         results = []
+        total = len(self.client.all_w3())
         for w3 in self.client.all_w3():
             try:
                 results.append(_read(w3))
@@ -188,7 +194,7 @@ class InboxContract:
             raise QuorumError(f"inbox RPCs disagree on snapshots({epoch}): {roots!r}")
         min_ts = min(r[1] for r in results)
         min_num = min(r[2] for r in results)
-        return results[0][0], L2View(timestamp=min_ts, number=min_num)
+        return results[0][0], L2View(timestamp=min_ts, number=min_num), len(results) == total
 
     def l2_view(self, tag: str) -> L2View:
         block = self.client.block(tag)
@@ -215,7 +221,7 @@ class InboxContract:
             topics=[event.topic, "0x" + epoch.to_bytes(32, "big").hex()],
             from_block=from_block,
             to_block=to_block,
-            chunk=100_000,
+            chunk=10_000,
         )
         return [dict(event.process_log(entry)["args"]) | {
             "tx_hash": entry["transactionHash"].to_0x_hex()

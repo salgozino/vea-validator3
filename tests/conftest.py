@@ -60,6 +60,7 @@ class FakeInbox:
         self.finalized: tuple[bytes, L2View] | None = None
         self.latest: tuple[bytes, L2View] | None = None
         self.quorum_split = False
+        self.complete = True  # every configured RPC answered
 
     def snapshot_quorum(self, epoch, tag):
         if self.quorum_split:
@@ -67,7 +68,7 @@ class FakeInbox:
         value = self.finalized if tag == "finalized" else self.latest
         if value is None:
             raise RuntimeError("no data")
-        return value
+        return (*value, self.complete)
 
 
 @pytest.fixture

@@ -109,13 +109,22 @@ class ChainClient:
         return int(self.with_failover(lambda w3: w3.eth.block_number))
 
     def supports_finalized(self) -> bool:
-        """True if the primary RPC serves a genuine `finalized` tag."""
-        try:
-            fin = self.block(FINALIZED)
-            latest = self.block(LATEST)
-        except Exception:  # noqa: BLE001
-            return False
-        return fin["number"] <= latest["number"] and fin["hash"] != latest["hash"]
+        """True if the primary RPC serves a genuine `finalized` tag.
+
+        An RPC that aliases finalized->latest returns the same block for both;
+        real finality always lags the head on live chains (retry once to ride
+        out the corner case of an idle chain tip).
+        """
+        for _ in range(2):
+            try:
+                fin = self.block(FINALIZED)
+                latest = self.block(LATEST)
+            except Exception:  # noqa: BLE001
+                return False
+            if fin["number"] < latest["number"]:
+                return True
+            time.sleep(2)
+        return False
 
     # -- logs -----------------------------------------------------------------
 

@@ -50,9 +50,10 @@ def test_inbox_finalized_quorum_read(inbox):
     view = inbox.l2_view(FINALIZED)
     assert view.timestamp > 1_700_000_000
     current_epoch = view.timestamp // 7_200
-    snap, snap_view = inbox.snapshot_quorum(current_epoch - 2, FINALIZED)
+    snap, snap_view, complete = inbox.snapshot_quorum(current_epoch - 2, FINALIZED)
     assert isinstance(snap, bytes) and len(snap) == 32
     assert snap_view.number <= inbox.l2_view(LATEST).number
+    assert complete in (True, False)
 
 
 def test_outbox_event_scan(outbox):

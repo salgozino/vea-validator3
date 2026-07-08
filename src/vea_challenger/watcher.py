@@ -18,6 +18,7 @@ from .detector import Detector
 from .notify import CRITICAL, INFO, WARNING, Notifier
 from .resolver import Resolver
 from .store import (
+    CHALLENGE_PENDING,
     CHALLENGED,
     L1_EXECUTED,
     RESOLVED,
@@ -70,12 +71,15 @@ def build_app(settings: Settings) -> App:
         ops_account = Account.from_key(settings.ops_private_key.get_secret_value())
         if challenge_account is None:
             challenge_account = ops_account
-    if challenge_account is not None and challenge_account.address == getattr(
-        ops_account, "address", None
-    ) and settings.ops_private_key is None:
+    if (
+        challenge_account is not None
+        and ops_account is not None
+        and challenge_account.address == ops_account.address
+    ):
         log.warning(
             "single key configured: slow resolution txs share a nonce lane with "
-            "deadline-critical challenges. Set VEA_OPS_PRIVATE_KEY for a second lane."
+            "deadline-critical challenges. Set both VEA_CHALLENGE_PRIVATE_KEY and "
+            "VEA_OPS_PRIVATE_KEY (different keys) for separate lanes."
         )
 
     detector = Detector(
@@ -141,6 +145,12 @@ def build_app(settings: Settings) -> App:
 def startup_checks(app: App) -> None:
     """Fail fast on anything that would silently corrupt verdicts later."""
     route = app.route
+
+    if len(route.inbox_chain.rpc_urls) < 2:
+        raise SystemExit(
+            "verdicts require at least 2 independent inbox-chain RPCs "
+            "(set VEA_INBOX_RPC_URLS with two or more providers)"
+        )
 
     for client, label in ((app.inbox.client, "inbox"), (app.outbox.client, "outbox")):
         cid = client.with_failover(lambda w3: w3.eth.chain_id)
@@ -220,6 +230,11 @@ def tick(app: App) -> None:
                     app.notifier.send(
                         CRITICAL, "watch-only mode: CANNOT challenge — intervene now"
                     )
+        elif row.status == CHALLENGE_PENDING and app.challenger is not None:
+            # A previous attempt failed or is stuck: retry every tick (with
+            # same-nonce fee replacement) until Challenged lands or the
+            # detector moves the row (front-run, verified, ...).
+            app.challenger.challenge(row)
 
     if app.resolver is not None:
         active = [
@@ -229,7 +244,15 @@ def tick(app: App) -> None:
         ]
         if active and app.resolver.bridge_shutdown():
             for row in active:
-                app.resolver.escape_hatch(row)
+                try:
+                    if row.status == RESOLVED:
+                        # Already ruled in our favor: withdrawChallengeDeposit
+                        # has no OnlyBridgeRunning guard and pays the reward.
+                        app.resolver.withdraw(row)
+                    else:
+                        app.resolver.escape_hatch(row)
+                except Exception:  # noqa: BLE001 - one row must not block the rest
+                    log.exception("shutdown handling failed for epoch %s", row.epoch)
         else:
             app.resolver.tick(active)
 

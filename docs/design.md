@@ -1,7 +1,9 @@
 # Vea Challenger Bot — Design
 
 Date: 2026-07-07
-Status: v2 — revised after adversarial red-team review (22 findings; all HIGH/CRITICAL adopted)
+Status: v3 — after two adversarial red-team passes in separate Opus sessions:
+design review (22 findings; all HIGH adopted) and implementation review
+(10 findings; all fixed, regression-tested in tests/test_redteam_fixes.py)
 
 ## Mission
 

@@ -46,14 +46,24 @@ class TxSender:
         urgency: float = 1.0,
         gas_limit: int | None = None,
         timeout: float = 300.0,
+        nonce_override: int | None = None,
     ) -> TxReceipt:
-        """Simulate, journal, broadcast and await one contract call."""
+        """Simulate, journal, broadcast and await one contract call.
+
+        ``nonce_override`` replaces a stuck in-flight tx at that nonce (the fee
+        logic must then price above the original for the replacement to enter
+        the mempool).
+        """
         tx_params: dict[str, Any] = {"from": self.account.address, "value": value}
         # eth_call simulation first: never broadcast a tx that reverts.
         fn.call(tx_params)
 
         fees = self.client.fees(urgency)
-        nonce = self.client.pending_nonce(self.account.address)
+        nonce = (
+            nonce_override
+            if nonce_override is not None
+            else self.client.pending_nonce(self.account.address)
+        )
         tx_params |= {
             "nonce": nonce,
             "maxFeePerGas": fees.max_fee_per_gas,
