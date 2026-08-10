@@ -83,8 +83,8 @@ BUILTIN_ROUTES: dict[str, RouteCfg] = {
         inbox_chain=_ARB_SEPOLIA,
         outbox_chain=_SEPOLIA,
         l1_chain=_SEPOLIA,
-        inbox_address="0x8B925669606026CcCfAFD72840F5b0CAeDA80078",
-        outbox_address="0xf720FA4575FB2FE96c7f05B1b5abc2d281cDa09a",
+        inbox_address="0xfB77B955B74B4441da5D595dF07236cf513A4B9b",
+        outbox_address="0x219aA6d151a1DafAF5a35A9c017Ff0B5a8900014",
         arb_bridge_address=_ARB_SEPOLIA_BRIDGE,
     ),
     "arb-sepolia-to-sepolia-devnet": RouteCfg(

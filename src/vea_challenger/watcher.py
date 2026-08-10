@@ -269,5 +269,12 @@ def run_loop(app: App) -> None:
             tick(app)
         except Exception:  # noqa: BLE001 - the loop must survive anything transient
             log.exception("tick failed")
+        else:
+            log.info(
+                "tick complete in %.1fs: %d active claim(s), outbox cursor at block %s",
+                time.monotonic() - started,
+                len(app.store.active_claims()),
+                app.store.get_cursor("outbox_events"),
+            )
         elapsed = time.monotonic() - started
         time.sleep(max(1.0, app.settings.poll_interval - elapsed))
