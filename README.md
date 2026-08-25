@@ -81,6 +81,30 @@ bot ever logs `INSUFFICIENT FUNDS to challenge`, treat it as an incident.
 - Startup self-checks fail fast: chain-id match, genuine `finalized` tag support,
   local `hashClaim` parity against the deployed contract, funding.
 
+## Docker
+
+```bash
+docker build -t vea-challenger .
+
+# state (SQLite db) persists under ./data on the host, mapped to /data in the container
+# the container runs as uid 1000, so the host dir must be writable by that uid
+mkdir -p data
+chown 1000:1000 data
+docker run -d --name vea-challenger \
+  --env-file .env \
+  -v "$(pwd)/data:/data" \
+  vea-challenger              # runs `vea-challenger run`
+
+# other subcommands override CMD, entrypoint is fixed to the `vea-challenger` binary
+docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger status
+docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger scan
+docker run --rm --env-file .env -v "$(pwd)/data:/data" vea-challenger challenge --epoch 246810
+```
+
+`VEA_DB_PATH` defaults to `/data/vea-challenger.db` in the image. For a custom
+route (`VEA_ROUTE_FILE`), also mount the TOML file under `/data` and point the
+env var at it, e.g. `-v $(pwd)/route.toml:/data/route.toml -e VEA_ROUTE_FILE=/data/route.toml`.
+
 ## Development
 
 ```bash
